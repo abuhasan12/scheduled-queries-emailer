@@ -1,0 +1,170 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  QueryID:
+    Type: String
+    Description: The ID of the saved query.
+  DatabaseName:
+    Type: String
+    Description: The name of the database used in the query execution. The database must exist in the catalog.
+  DatabaseCatalog:
+    Type: String
+    Description: The name of the data catalog used in the query execution.
+    Default: AwsDataCatalog
+  DataInS3:
+    Type: String
+    Description: If the query involves querying data in an s3 bucket, type 'true', otherwise leave 'false'.
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  S3DataBucketName:
+    Type: String
+    Description: The Name of the S3 bucket with the data in to be queried. Leave blank if not applicable.
+  S3DataBucketHasKMSEncryption:
+    Type: String
+    Description: If the S3 bucket containing the data to be queried is encrypted using KMS.
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  S3DataBucketKMSKeyARN:
+    Type: String
+    Description: The ARN of the KMS Key for decrypting the data in the S3 bucket to be queried. Leave blank if not applicable.
+
+Conditions:
+  DataInS3Condition: !Equals [!Ref DataInS3, "true"]
+  KMSKeyARNCondition: !Equals [!Ref S3DataBucketHasKMSEncryption, "true"]
+
+Resources:
+  AthenaQueryResultsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-${AWS::Region}-${AWS::AccountId}'
+
+  QueryRunnerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-query-runner-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-query-runner-lambda-execution-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                  - athena:*
+                  - glue:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:PutObject"
+                  - "s3:List*"
+                Resource:
+                  - !Sub arn:aws:s3:::${AthenaQueryResultsBucket}
+                  - !Sub arn:aws:s3:::${AthenaQueryResultsBucket}/*
+                  - Fn::If:
+                      - DataInS3Condition
+                      - !Join
+                        - ''
+                        - - 'arn:aws:s3:::'
+                          - !Ref S3DataBucketName
+                      - !Ref AWS::NoValue
+                  - Fn::If:
+                      - DataInS3Condition
+                      - !Join
+                        - ''
+                        - - 'arn:aws:s3:::'
+                          - !Ref S3DataBucketName
+                          - '/*'
+                      - !Ref AWS::NoValue
+              - Fn::If:
+                - KMSKeyARNCondition
+                - Effect: Allow
+                  Action:
+                    - "kms:Decrypt"
+                  Resource:
+                    Ref: S3DataBucketKMSKeyARN
+                - !Ref AWS::NoValue
+
+  QueryRunnerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-query-runner-lambda'
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 128
+      Role: !GetAtt QueryRunnerLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          QueryID: !Ref QueryID
+          DatabaseName: !Ref DatabaseName
+          DatabaseCatalog: !Ref DatabaseCatalog
+          OutputBucket: !Sub 's3://${AthenaQueryResultsBucket}/'
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime
+
+          now = datetime.now()
+          current_time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+          client = boto3.client('athena')
+
+          def lambda_handler(event, context):
+              # Get variables
+              query_id = os.environ['QueryID']
+              db_name = os.environ['DatabaseName']
+              catalog = os.environ['DatabaseCatalog']
+              output_bucket = os.environ['OutputBucket']
+              output_location = output_bucket + current_time
+
+              # Get the named query using its ID
+              response = client.get_named_query(NamedQueryId=query_id)
+
+              # Extract the query string from the response
+              query_string = response['NamedQuery']['QueryString']
+
+              # Start query execution using the query string
+              response = client.start_query_execution(
+                  QueryString=query_string,
+                  QueryExecutionContext={
+                      'Database': db_name,
+                      'Catalog': catalog
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': output_location
+                  }
+              )
+
+              # Return the query execution ID
+              return {
+                  'statusCode': 200,
+                  'body': {
+                    'message': 'Query execution started',
+                    'query_execution_id': response['QueryExecutionId']
+                }
+              }
+
+  QueryScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-rule
+      ScheduleExpression: cron(0 3 1 * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt QueryRunnerLambda.Arn
+          Id: !Ref QueryRunnerLambda
+
+Outputs:
+  QueryResultsBucketName:
+    Value: !Ref AthenaQueryResultsBucket
