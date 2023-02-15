@@ -27,6 +27,10 @@ Parameters:
   S3DataBucketKMSKeyARN:
     Type: String
     Description: The ARN of the KMS Key for decrypting the data in the S3 bucket to be queried. Leave blank if not applicable.
+  ScheduleExpression:
+    Type: String
+    Description: Use Cron expression to provide a schedule for the event.
+    Default: "cron(? ? ? ? ? ?)"
 
 Conditions:
   DataInS3Condition: !Equals [!Ref DataInS3, "true"]
@@ -159,7 +163,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub ${AWS::StackName}-rule
-      ScheduleExpression: cron(0 3 1 * ? *)
+      ScheduleExpression: !Ref ScheduleExpression
       State: ENABLED
       Targets:
         - Arn: !GetAtt QueryRunnerLambda.Arn
