@@ -168,6 +168,14 @@ Resources:
       Targets:
         - Arn: !GetAtt QueryRunnerLambda.Arn
           Id: !Ref QueryRunnerLambda
+  
+  EventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt QueryRunnerLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt QueryScheduleRule.Arn
 
 Outputs:
   QueryResultsBucketName:
